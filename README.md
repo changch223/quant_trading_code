@@ -190,94 +190,99 @@ rank_score = POP * Credit
 
 ---
 
+
+
 ## 8. Excel 輸出與閱讀指南（最重要）
 
 系統最終把所有表格寫入同一個 Excel（本地 `/tmp/sim_trades.xlsx`，並上傳到 GCS：**latest + archive**）。
 
 ### 8.1 主要分頁
 
-1. **Positions**（主交易簿）
-   \| 欄位 | 說明 |
-   \|---|---|
-   \| TradeID | 交易流水號（整數遞增） |
-   \| Date | 建倉時間（UTC） |
-   \| Ticker | 標的代號 |
-   \| Strategy | `Short Put Credit Spread` / `Short Call Credit Spread` |
-   \| Legs | 例如：`Short AAPL 2025-10-17 180P / Long 175P` |
-   \| Exp | 到期日（YYYY-MM-DD） |
-   \| DTE\_Orig | 建倉時距到期天數 |
-   \| EntryCredit | 入場權利金（已扣 5% 滑價），單位：USD/價差 |
-   \| MaxLoss | 該價差最大虧損 |
-   \| Qty | 數量（目前=1） |
-   \| Status | `OPEN` / `CLOSED` |
-   \| Thesis | 簡述（例如「IV高、動能穩健…」） |
-   \| Spot\_Entry | 入場時標的現價 |
-   \| Delta\_Sh | 淨 Delta（股數） |
-   \| Vega\_\$ | 淨 Vega（每 1.00 vol 變化的美元變動） |
-   \| Sector | 產業 |
-   \| SpreadNow | 當前中間價（短腿−長腿）×100 |
-   \| PnL\$ | 含未實現損益（USD） |
-   \| ExitDate | 平倉時間（UTC） |
-   \| ExitDebit | 出場成本（含 5% 滑價） |
-   \| RealizedPnL | 已實現損益（USD） |
-   \| CloseReason | `TP`/`SL`/`DTE`/`EXP` |
+1. **Positions（主交易簿）**
 
-> **閱讀重點**：
->
-> * **風險**：看 `MaxLoss` 與 `Qty`；
-> * **進度**：`SpreadNow` 相對 `EntryCredit` 的比率（離 TP/SL 多遠）；
-> * **部位健康**：`DTE`（可由 `Exp` 推回）、`PnL$`、`Delta_Sh`/`Vega_$` 合計占 NAV 的比例。
+    | 欄位            | 說明                                                        |
+    |-----------------|-------------------------------------------------------------|
+    | `TradeID`       | 交易流水號（整數遞增）                                      |
+    | `Date`          | 建倉時間（UTC）                                             |
+    | `Ticker`        | 標的代號                                                    |
+    | `Strategy`      | `Short Put Credit Spread` / `Short Call Credit Spread`      |
+    | `Legs`          | 例如：`Short AAPL 2025-10-17 180P / Long 175P`              |
+    | `Exp`           | 到期日（YYYY-MM-DD）                                        |
+    | `DTE_Orig`      | 建倉時距到期天數                                            |
+    | `EntryCredit`   | 入場權利金（已扣 5% 滑價），單位：USD/價差                  |
+    | `MaxLoss`       | 該價差最大虧損                                              |
+    | `Qty`           | 數量（目前=1）                                              |
+    | `Status`        | `OPEN` / `CLOSED`                                           |
+    | `Thesis`        | 簡述（例如「IV高、動能穩健…」）                             |
+    | `Spot_Entry`    | 入場時標的現價                                              |
+    | `Delta_Sh`      | 淨 Delta（股數）                                            |
+    | `Vega_$`        | 淨 Vega（每 1.00 vol 變化的美元變動）                       |
+    | `Sector`        | 產業                                                        |
+    | `SpreadNow`     | 當前中間價（短腿−長腿）×100                                 |
+    | `PnL$`          | 含未實現損益（USD）                                         |
+    | `ExitDate`      | 平倉時間（UTC）                                             |
+    | `ExitDebit`     | 出場成本（含 5% 滑價）                                      |
+    | `RealizedPnL`   | 已實現損益（USD）                                           |
+    | `CloseReason`   | `TP` / `SL` / `DTE` / `EXP`                                  |
 
-2. **TodaysPicks**（當日新建倉建議清單／實際已下單）
-   \| 欄位 | 說明 |
-   \|---|---|
-   \| Ticker / Strategy / Legs | 同上 |
-   \| POP | 買方不觸發區間機率（B-S） |
-   \| Credit(\$) | 權利金（未扣滑價的理論入場） |
-   \| MaxLoss(\$) | 最大虧損 |
-   \| DTE | 到期天數 |
-   \| Delta\_Sh / Vega\_\$ | 淨 Greeks |
-   \| Thesis / Sector | 簡述與產業 |
+    **閱讀重點：**
+    - **風險**：看 `MaxLoss` 與 `Qty`。
+    - **進度**：`SpreadNow` 相對 `EntryCredit` 的比率（離 TP/SL 多遠）。
+    - **部位健康**：`DTE`（可由 `Exp` 推回）、`PnL$`、`Delta_Sh` / `Vega_$` 合計占 NAV 的比例。
 
-> **閱讀重點**：當日選入的 1–5 檔，**POP ≥ 0.7**、**Credit/MaxLoss ≥ 0.33**、**每筆 MaxLoss ≤ 0.5% NAV**、**產業≤2 檔**。
+2. **TodaysPicks（當日新建倉建議清單／實際已下單）**
 
-3. **ScanSnapshot**（宇宙掃描結果 Top 15）
-   \| 欄位 | 說明 |
-   \|---|---|
-   \| ticker / price / exp | 標的、現價、擬用到期 |
-   \| iv / atr\_pct | ATM IV 估計、ATR% |
-   \| chain\_vol / chain\_oi | 期權鏈總成交量/未平倉量 |
-   \| dollar\_vol | 20 日 \$ 成交額 |
-   \| \*\_z | 各欄 z-score |
-   \| score | 綜合打分（用來挑 Top 15） |
+    | 欄位                             | 說明                                |
+    |----------------------------------|-------------------------------------|
+    | `Ticker` / `Strategy` / `Legs`   | 同上                                |
+    | `POP`                            | 買方不觸發區間機率（B-S）           |
+    | `Credit($)`                      | 權利金（未扣滑價的理論入場）        |
+    | `MaxLoss($)`                     | 最大虧損                            |
+    | `DTE`                            | 到期天數                            |
+    | `Delta_Sh` / `Vega_$`            | 淨 Greeks                           |
+    | `Thesis` / `Sector`              | 簡述與產業                          |
 
-> **閱讀重點**：觀察當日被挑入候選的市場面貌（是高 IV 的哪些產業？）。
+    **閱讀重點：** 當日選入的 1–5 檔，**POP ≥ 0.7**、**Credit/MaxLoss ≥ 0.33**、**每筆 MaxLoss ≤ 0.5% NAV**、**產業 ≤ 2 檔**。
 
-4. **Trades**（交易日誌）
-   \| 欄位 | 說明 |
-   \|---|---|
-   \| Datetime | UTC 時間 |
-   \| TradeID | 對應 Positions |
-   \| Side | `OPEN` / `CLOSE` |
-   \| Ticker / Strategy / Legs / Exp | 如上 |
-   \| Price | OPEN=入場 credit（已扣 5%），CLOSE=出場 debit（含 5%） |
-   \| Qty / Note | 數量；原因（ENTRY/TP/SL/DTE/EXP） |
+3. **ScanSnapshot（宇宙掃描結果 Top 15）**
 
-> **閱讀重點**：逐筆審計；對齊**實單執行**時也可對接此格式。
+    | 欄位                         | 說明                         |
+    |------------------------------|------------------------------|
+    | `ticker` / `price` / `exp`   | 標的、現價、擬用到期        |
+    | `iv` / `atr_pct`             | ATM IV 估計、ATR%            |
+    | `chain_vol` / `chain_oi`     | 期權鏈總成交量 / 未平倉量    |
+    | `dollar_vol`                 | 20 日美元成交額              |
+    | `*_z`                        | 各欄 z-score                 |
+    | `score`                      | 綜合打分（用來挑 Top 15）    |
 
-5. **DailyNAV**（績效曲線快照，逐日唯一一筆）
-   \| 欄位 | 說明 |
-   \|---|---|
-   \| Date | YYYY-MM-DD |
-   \| RealizedPnLToDate | 截至當日的累計已實現損益 |
-   \| OpenPnL | 當日所有 OPEN 的未實現損益合計 |
-   \| NAV | `NAV0 + Realized + OpenPnL` |
-   \| OpenPositions | 未平倉筆數 |
+    **閱讀重點：** 觀察當日被挑入候選的市場面貌（高 IV 集中在哪些產業？）。
 
-> **閱讀重點**：用來畫資產曲線與回撤；追蹤**倉位數**變化。
+4. **Trades（交易日誌）**
+
+    | 欄位                               | 說明                                               |
+    |------------------------------------|----------------------------------------------------|
+    | `Datetime`                         | UTC 時間                                           |
+    | `TradeID`                          | 對應 Positions                                     |
+    | `Side`                             | `OPEN` / `CLOSE`                                   |
+    | `Ticker` / `Strategy` / `Legs` / `Exp` | 如上                                          |
+    | `Price`                            | `OPEN`=入場 credit（已扣 5%），`CLOSE`=出場 debit（含 5%） |
+    | `Qty` / `Note`                     | 數量；原因（`ENTRY`/`TP`/`SL`/`DTE`/`EXP`）        |
+
+    **閱讀重點：** 逐筆審計；對齊**實單執行**時也可對接此格式。
+
+5. **DailyNAV（績效曲線快照，逐日唯一一筆）**
+
+    | 欄位                 | 說明                                  |
+    |----------------------|---------------------------------------|
+    | `Date`               | YYYY-MM-DD                            |
+    | `RealizedPnLToDate`  | 截至當日的累計已實現損益              |
+    | `OpenPnL`            | 當日所有 `OPEN` 的未實現損益合計      |
+    | `NAV`                | `NAV0 + Realized + OpenPnL`           |
+    | `OpenPositions`      | 未平倉筆數                            |
+
+    **閱讀重點：** 用來畫資產曲線與回撤；追蹤**倉位數**變化。
 
 
----
 
 ## 9. 主要參數（可調矩陣）
 
