@@ -1,0 +1,6 @@
+flask
+google-cloud-storage
+pandas
+numpy
+yfinance
+xlsxwriter
