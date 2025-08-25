@@ -16,17 +16,17 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ---------- Optional: requests_cache ----------
 REQUESTS_CACHE_ENABLED = False
-try:
-    import requests_cache
-    # 15 分鐘 HTTP 層級快取（若已安裝）
-    requests_cache.install_cache(
-        cache_name="yf_http_cache",
-        backend="sqlite",
-        expire_after=15 * 60
-    )
-    REQUESTS_CACHE_ENABLED = True
-except Exception:
-    REQUESTS_CACHE_ENABLED = False
+#try:
+#    import requests_cache
+#    # 15 分鐘 HTTP 層級快取（若已安裝）
+#    requests_cache.install_cache(
+#        cache_name="yf_http_cache",
+#        backend="sqlite",
+#        expire_after=15 * 60
+#    )
+#    REQUESTS_CACHE_ENABLED = True
+#except Exception:
+#    REQUESTS_CACHE_ENABLED = False
 
 # ============================================
 # Global Config
@@ -59,9 +59,9 @@ CHAIN_TTL_SEC   = 15 * 60
 OPTLIST_TTL_SEC = 6 * 60 * 60
 HIST_TTL_SEC    = 30 * 60
 
-RATE_DELAY_BASE = 0.7   # 每次抓期權鏈後 sleep 秒數（再加抖動）
-MAX_RETRIES     = 4     # 429 退避最大重試
-BACKOFF_BASE    = 1.5   # 退避倍率
+RATE_DELAY_BASE = 0.4   # 每次抓期權鏈後 sleep 秒數（再加抖動）
+MAX_RETRIES     = 6     # 429 退避最大重試
+BACKOFF_BASE    = 1.8   # 退避倍率
 
 LOG_DIR = Path("run_logs"); LOG_DIR.mkdir(exist_ok=True)
 
@@ -179,37 +179,60 @@ def yf_history(ticker, period="3mo", interval="1d") -> pd.DataFrame:
         _cache_set(key, df)
     return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
+
+OPTIONS_MAX_TRIES  = 2      # 只試 2 次
+OPTIONS_BACKOFFS   = [0.35, 0.80]   # 兩次失敗各睡這麼久（秒）
+
 def yf_options_list(ticker) -> List[str]:
     key = f"opts:{ticker}"
     obj = _cache_get(key, OPTLIST_TTL_SEC)
     if obj is not None:
         return obj
-    _count_http()
-    def _do():
-        return yf.Ticker(ticker).options
-    exps = _with_retry(_do)
-    if isinstance(exps, list) and exps:
-        _cache_set(key, exps)
-        return exps
-    return []
 
-def yf_option_chain(ticker, exp) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """回傳 (calls, puts)，15 分鐘快取 + 每次抓完 sleep 0.5~1.0 秒。"""
+    for attempt in range(OPTIONS_MAX_TRIES):
+        _count_http()
+        exps = []
+        try:
+            exps = yf.Ticker(ticker).options or []
+        except Exception:
+            exps = []
+
+        if exps:                      # 成功 -> 回存 + 小睡一下
+            _cache_set(key, exps)
+            _sleep(0.10 + random.random()*0.15)
+            return exps
+
+        # 空清單視為軟限流：輕退避（固定幾百毫秒，不要指數級別）
+        _sleep(OPTIONS_BACKOFFS[attempt] + random.random()*0.20)
+
+    return []   # 兩次都空就放棄，不要把空結果快取
+
+
+
+def yf_option_chain(ticker, exp):
     key = f"chain:{ticker}:{exp}"
     obj = _cache_get(key, CHAIN_TTL_SEC)
     if obj is not None:
         return obj.get("calls", pd.DataFrame()), obj.get("puts", pd.DataFrame())
+
     _count_http()
-    def _do():
-        return yf.Ticker(ticker).option_chain(exp)
+    def _do(): return yf.Ticker(ticker).option_chain(exp)
     ch = _with_retry(_do)
-    # 固定節流（再加隨機抖動）
+    if ch is None:
+        # Fallback：再試一次直呼
+        try:
+            ch = yf.Ticker(ticker).option_chain(exp)
+        except Exception:
+            ch = None
+
     _sleep(RATE_DELAY_BASE + random.random() * 0.5)
     if ch is None:
         return pd.DataFrame(), pd.DataFrame()
+
     calls, puts = ch.calls.copy(), ch.puts.copy()
     _cache_set(key, {"calls": calls, "puts": puts})
     return calls, puts
+
 
 # ============================================
 # Universe & scanner
@@ -244,46 +267,48 @@ def near_dte_exp(ticker, min_dte=21, max_dte=60) -> Optional[pd.Timestamp]:
             best, gap = pd.Timestamp(d), dte - max_dte
     return best
 
-def option_liq_iv_snapshot(t) -> Optional[dict]:
-    h = yf_history(t, period="3mo", interval="1d")
-    if h.empty: return None
-    px = float(h["Close"].iloc[-1])
-    if not np.isfinite(px) or px < MIN_PRICE: return None
+# 放在檔案頂部
+SKIP = {"hist":0,"price":0,"dollar_vol":0,"exp":0,"chain":0,"iv_nan":0,"liq":0}
 
-    # 20D $ volume
+def option_liq_iv_snapshot(t):
+    h = yf_history(t, period="3mo", interval="1d")
+    if h.empty:
+        SKIP["hist"] += 1; return None
+    px = float(h["Close"].iloc[-1])
+    if not np.isfinite(px) or px < MIN_PRICE:
+        SKIP["price"] += 1; return None
+
     dollar_vol = float((h["Close"] * h["Volume"]).rolling(20).mean().iloc[-1])
     if not np.isfinite(dollar_vol) or dollar_vol < MIN_DOLLAR_VOL:
-        return None
+        SKIP["dollar_vol"] += 1; return None
 
     exp = near_dte_exp(t, 21, 60)
-    if exp is None: return None
+    if exp is None:
+        SKIP["exp"] += 1; return None
 
     calls, puts = yf_option_chain(t, exp.strftime("%Y-%m-%d"))
-    if calls.empty or puts.empty: return None
+    if calls.empty or puts.empty:
+        SKIP["chain"] += 1; return None
 
-    # ATM IV 中位數
-    strikes = puts["strike"]
-    k_idx = (strikes - px).abs().argsort()[:3]
-    atm_strikes = set(strikes.iloc[k_idx].tolist())
+    strikes = puts["strike"]; k_idx = (strikes - px).abs().argsort()[:3]
+    atm = set(strikes.iloc[k_idx].tolist())
     ivs = pd.concat([
-        calls[calls["strike"].isin(atm_strikes)]["impliedVolatility"],
-        puts[puts["strike"].isin(atm_strikes)]["impliedVolatility"]
+        calls[calls["strike"].isin(atm)]["impliedVolatility"],
+        puts[puts["strike"].isin(atm)]["impliedVolatility"]
     ]).replace(0, np.nan).dropna()
-    iv = float(np.nanmedian(ivs)) if len(ivs) else np.nan
+    if ivs.empty:
+        SKIP["iv_nan"] += 1; return None
+    iv = float(np.nanmedian(ivs))
 
     chain_vol = float(calls["volume"].fillna(0).sum() + puts["volume"].fillna(0).sum())
     chain_oi  = float(calls["openInterest"].fillna(0).sum() + puts["openInterest"].fillna(0).sum())
     if chain_vol < MIN_CHAIN_VOL or chain_oi < MIN_CHAIN_OI:
-        return None
+        SKIP["liq"] += 1; return None
 
-    # 14D ATR%
-    atr_pct = float((h["High"] - h["Low"]).rolling(14).mean().iloc[-1] / px)
+    return dict(ticker=t, price=px, exp=str(exp.date()),
+                iv=iv, chain_vol=chain_vol, chain_oi=chain_oi,
+                dollar_vol=dollar_vol, atr_pct=float((h["High"]-h["Low"]).rolling(14).mean().iloc[-1]/px))
 
-    return dict(
-        ticker=t, price=px, exp=str(exp.date()),
-        iv=iv, chain_vol=chain_vol, chain_oi=chain_oi,
-        dollar_vol=dollar_vol, atr_pct=atr_pct
-    )
 
 def scan_liquid_high_iv(top_n=TOP_N):
     rows=[]
@@ -729,6 +754,7 @@ def run_once(base_positions: Optional[pd.DataFrame]=None):
     print(f"\nCandidates: {len(candidates)} | Selected today: {len(todays_df)}")
     print(f"HTTP calls (approx): {HTTP_CALLS} | 429s caught: {HTTP_429S} | avg RPS: {rps:.3f} | sleep_accum: {SLEEP_SEC_ACCUM:.1f}s")
     print(f"Excel saved -> {EXCEL_PATH}")
+    print("Skip reasons:", SKIP)
 
     # 回傳三個 DataFrame，給 app.py 上傳到 GCS
     return book, todays_df, scan_snapshot
