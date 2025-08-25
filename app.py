@@ -1,3 +1,7 @@
+# ============================================
+# app.py  
+# ============================================
+
 import os, io, json
 from datetime import datetime, timezone
 from flask import Flask, jsonify
@@ -59,3 +63,7 @@ def run_scan():
 @app.get("/healthz")
 def healthz():
     return "ok", 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

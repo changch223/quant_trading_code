@@ -1,6 +1,11 @@
 flask
+gunicorn
 google-cloud-storage
 pandas
 numpy
 yfinance
 xlsxwriter
+openpyxl
+requests-cache
+lxml
+beautifulsoup4   # ← 有些 pandas.html.parse 需要

@@ -601,18 +601,20 @@ def save_book(positions: pd.DataFrame, todays: pd.DataFrame, scan_table: Optiona
         if scan_table is not None and not scan_table.empty:
             scan_table.to_excel(w, index=False, sheet_name="ScanSnapshot")
 
-# 在 scanner_core.py 中加：
+
+
+# ============================================
+# Run-once main
+# ============================================
+
+
 def empty_positions_df():
     cols=["TradeID","Date","Ticker","Strategy","Legs","Exp","DTE_Orig",
           "EntryCredit","MaxLoss","Qty","Status","Thesis",
           "Spot_Entry","Delta_Sh","Vega_$","Sector","SpreadNow","PnL$"]
     return pd.DataFrame(columns=cols)
 
-# ============================================
-# Run-once main
-# ============================================
-
-def run_once():
+def run_once(base_positions: Optional[pd.DataFrame]=None):
     global HTTP_CALLS, HTTP_429S, SLEEP_SEC_ACCUM
     HTTP_CALLS = 0; HTTP_429S = 0; SLEEP_SEC_ACCUM = 0.0
     t0 = time.time()
@@ -621,10 +623,7 @@ def run_once():
     tickers, scan_snapshot = scan_liquid_high_iv(TOP_N)
     print(f"Universe picks (top {TOP_N}):", tickers)
 
-    # B) Load existing + MTM
-    book = load_positions()
-    
-  # 用 base_positions 取代讀本地 Excel（若有帶進來）
+    # B) Load existing + MTM（優先用外部傳入的 base_positions）
     if base_positions is not None and isinstance(base_positions, pd.DataFrame):
         book = base_positions.copy()
     else:
@@ -694,17 +693,11 @@ def run_once():
         selected.append(c)
         sector_counts[c.sector] = sector_counts.get(c.sector, 0) + 1
         todays.append({
-            "Ticker": c.ticker,
-            "Strategy": c.strategy,
-            "Legs": c.legs,
-            "POP": round(c.pop,3),
-            "Credit($)": round(c.credit,2),
-            "MaxLoss($)": round(c.max_loss,2),
-            "DTE": c.dte,
-            "Delta_Sh": round(c.net_delta_shares,2),
-            "Vega_$": round(c.net_vega_dollars,2),
-            "Thesis": thesis[:30],
-            "Sector": c.sector
+            "Ticker": c.ticker, "Strategy": c.strategy, "Legs": c.legs,
+            "POP": round(c.pop,3), "Credit($)": round(c.credit,2),
+            "MaxLoss($)": round(c.max_loss,2), "DTE": c.dte,
+            "Delta_Sh": round(c.net_delta_shares,2), "Vega_$": round(c.net_vega_dollars,2),
+            "Thesis": thesis[:30], "Sector": c.sector
         })
 
     todays_df = pd.DataFrame(todays)
@@ -717,53 +710,29 @@ def run_once():
             rows.append({
                 "TradeID": start_id + i,
                 "Date": _now_utc().strftime("%Y-%m-%d %H:%M"),
-                "Ticker": r["Ticker"],
-                "Strategy": r["Strategy"],
-                "Legs": r["Legs"],
-                "Exp": r["Legs"].split()[2],      # "Short TKR 2025-09-20 ..."
-                "DTE_Orig": r["DTE"],
-                "EntryCredit": r["Credit($)"],
-                "MaxLoss": r["MaxLoss($)"],
-                "Qty": 1,
-                "Status": "OPEN",
-                "Thesis": r["Thesis"],
+                "Ticker": r["Ticker"], "Strategy": r["Strategy"], "Legs": r["Legs"],
+                "Exp": r["Legs"].split()[2], "DTE_Orig": r["DTE"],
+                "EntryCredit": r["Credit($)"], "MaxLoss": r["MaxLoss($)"],
+                "Qty": 1, "Status": "OPEN", "Thesis": r["Thesis"],
                 "Spot_Entry": float(yf_history(r["Ticker"], period="1d", interval="1d")["Close"].iloc[-1]),
-                "Delta_Sh": r["Delta_Sh"],
-                "Vega_$": r["Vega_$"],
-                "Sector": r["Sector"],
-                "SpreadNow": np.nan,
-                "PnL$": np.nan
+                "Delta_Sh": r["Delta_Sh"], "Vega_$": r["Vega_$"],
+                "Sector": r["Sector"], "SpreadNow": np.nan, "PnL$": np.nan
             })
         book = pd.concat([book, pd.DataFrame(rows)], ignore_index=True)
 
-    # G) Save Excel
+    # G) Save Excel（本地；Cloud Run 版用 app.py 會寫 GCS）
     save_book(book, todays_df, scan_snapshot)
 
-    # H) Metrics & logging
+    # H) Metrics & logging（stdout 由 Cloud Run 收）
     elapsed = max(1e-6, time.time() - t0)
     rps = HTTP_CALLS / elapsed
     print(f"\nCandidates: {len(candidates)} | Selected today: {len(todays_df)}")
     print(f"HTTP calls (approx): {HTTP_CALLS} | 429s caught: {HTTP_429S} | avg RPS: {rps:.3f} | sleep_accum: {SLEEP_SEC_ACCUM:.1f}s")
     print(f"Excel saved -> {EXCEL_PATH}")
 
-    # Write run log
-    log_name = LOG_DIR / f"run_{_now_utc().strftime('%Y%m%d_%H%M%S')}.log"
-    try:
-        with open(log_name, "w", encoding="utf-8") as f:
-            f.write(f"Time(UTC):       {_now_utc().isoformat()}\n")
-            f.write(f"Universe picks:  {tickers}\n")
-            f.write(f"Candidates:      {len(candidates)} | Selected today: {len(todays_df)}\n")
-            f.write(f"HTTP calls:      {HTTP_CALLS}\n")
-            f.write(f"429 caught:      {HTTP_429S}\n")
-            f.write(f"Avg RPS:         {rps:.3f}\n")
-            f.write(f"Sleep accum:     {SLEEP_SEC_ACCUM:.1f}s\n")
-            f.write("\nTodays Picks:\n")
-            if not todays_df.empty:
-                f.write(todays_df.to_csv(index=False))
-            else:
-                f.write("(none)\n")
-    except Exception:
-        pass
+    # 回傳三個 DataFrame，給 app.py 上傳到 GCS
+    return book, todays_df, scan_snapshot
+
 
 # --- Jupyter: 呼叫 run_once() 即可 ---
 # run_once()
