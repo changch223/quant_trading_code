@@ -12,21 +12,56 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+import io
+from google.cloud import storage
 
-# ---------- Optional: requests_cache ----------
-REQUESTS_CACHE_ENABLED = False
-#try:
-#    import requests_cache
-#    # 15 分鐘 HTTP 層級快取（若已安裝）
-#    requests_cache.install_cache(
-#        cache_name="yf_http_cache",
-#        backend="sqlite",
-#        expire_after=15 * 60
-#    )
-#    REQUESTS_CACHE_ENABLED = True
-#except Exception:
-#    REQUESTS_CACHE_ENABLED = False
+GCS_BUCKET = os.getenv("GCS_BUCKET")                     # 例如 "my-bucket"
+GCS_LATEST = os.getenv("GCS_LATEST", "sim_trades/latest.xlsx")
+GCS_ARCHIVE_PREFIX = os.getenv("GCS_ARCHIVE_PREFIX", "sim_trades/archive/")
+
+def gcs_download_latest():
+    if not GCS_BUCKET: return False
+    client = storage.Client()
+    b = client.bucket(GCS_BUCKET).blob(GCS_LATEST)
+    if b.exists(client):
+        b.download_to_filename(EXCEL_PATH)
+        return True
+    return False
+
+def gcs_upload_workbook(sheets: Dict[str, pd.DataFrame]):
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as w:
+        for name, df in sheets.items():
+            df.to_excel(w, index=False, sheet_name=name)
+    bio.seek(0)
+
+    if not GCS_BUCKET:
+        with open(EXCEL_PATH, "wb") as f:
+            f.write(bio.getbuffer())
+        return
+
+    client = storage.Client()
+    bucket = client.bucket(GCS_BUCKET)
+
+    # 1) 最新版（覆蓋即可）
+    blob_latest = bucket.blob(GCS_LATEST)
+    bio.seek(0)
+    blob_latest.upload_from_file(
+        bio, rewind=True,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # 2) 歸檔版（不覆蓋）：檔名含秒 + 隨機碼
+    stamp = _now_utc().strftime("%Y-%m-%d_%H%M%S")
+    uniq  = f"{random.randint(1000,9999)}"
+    arch_key = f"{GCS_ARCHIVE_PREFIX}sim_trades_{stamp}_{uniq}.xlsx"
+    blob_arch = bucket.blob(arch_key)
+    bio.seek(0)
+    blob_arch.upload_from_file(
+        bio, rewind=True,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
 
 # ============================================
 # Global Config
@@ -40,7 +75,8 @@ MIN_CREDIT_DOLLARS = 60               # 最低收權利金
 RISK_FREE = 0.045                     # annualized
 MIN_DTE, MAX_DTE = 25, 45             # 目標到期區間
 TOP_N = 15                            # 掃描前 15 名
-EXCEL_PATH = "sim_trades.xlsx"
+EXCEL_PATH = os.getenv("EXCEL_PATH", "/tmp/sim_trades.xlsx")
+
 
 # Scanner thresholds
 UNIVERSE = "sp500"                    # 或指定 list
@@ -54,7 +90,9 @@ PUT_DELTA_TARGETS  = [0.20, 0.25, 0.30, 0.35]
 CALL_DELTA_TARGETS = [0.30, 0.35, 0.40, 0.45]
 
 # Rate-limit & cache
-CACHE_DIR = Path(".yf_cache"); CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/.yf_cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 CHAIN_TTL_SEC   = 15 * 60
 OPTLIST_TTL_SEC = 6 * 60 * 60
 HIST_TTL_SEC    = 30 * 60
@@ -63,12 +101,21 @@ RATE_DELAY_BASE = 0.4   # 每次抓期權鏈後 sleep 秒數（再加抖動）
 MAX_RETRIES     = 6     # 429 退避最大重試
 BACKOFF_BASE    = 1.8   # 退避倍率
 
-LOG_DIR = Path("run_logs"); LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = Path(os.getenv("LOG_DIR", "/tmp/run_logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # HTTP metrics（估算層級；yfinance 內部仍可能有多個請求）
 HTTP_CALLS = 0
 HTTP_429S  = 0
 SLEEP_SEC_ACCUM = 0.0
+
+# ----- Entry/Exit rules & slippage -----
+TAKE_PROFIT_PCT   = 0.50   # 目標：吃到 50% 權利金就平倉
+STOP_LOSS_MULT    = 2.00   # 風險：虧損達 2x 權利金就停損
+EXIT_AT_DTE_LE    = 7      # 到期前 N 天全部了結
+SLIPPAGE_PCT      = 0.05   # 進出場滑價（5%）：賣出少收、買回多付
+NAV0              = NAV    # 初始資金，用來計算 NAV 曲線
+
 
 def _now_utc():
     return datetime.now(timezone.utc)
@@ -584,18 +631,30 @@ def rank_candidates(candidates: List[Candidate]) -> List[Tuple[Candidate, float,
 # Book & MTM
 # ============================================
 
-def load_positions() -> pd.DataFrame:
-    if os.path.exists(EXCEL_PATH):
-        try:
-            return pd.read_excel(EXCEL_PATH, sheet_name="Positions")
-        except Exception:
-            pass
-    cols=["TradeID","Date","Ticker","Strategy","Legs","Exp","DTE_Orig",
-          "EntryCredit","MaxLoss","Qty","Status","Thesis",
-          "Spot_Entry","Delta_Sh","Vega_$","Sector","SpreadNow","PnL$"]
-    return pd.DataFrame(columns=cols)
+
+
+
+def save_book(positions: pd.DataFrame, todays: pd.DataFrame, scan_table: Optional[pd.DataFrame]=None):
+    with pd.ExcelWriter(EXCEL_PATH, engine="xlsxwriter") as w:
+        positions.to_excel(w, index=False, sheet_name="Positions")
+        todays.to_excel(w, index=False, sheet_name="TodaysPicks")
+        if scan_table is not None and not scan_table.empty:
+            scan_table.to_excel(w, index=False, sheet_name="ScanSnapshot")
+
+
+
+def _parse_strike_legs(legs: str) -> Tuple[float, float, bool]:
+    """回傳(short_k, long_k, is_put)"""
+    try:
+        k_short = float(legs.split()[3].rstrip("PC"))
+        is_put  = legs.split()[3].endswith("P")
+        k_long  = float(legs.split()[-1].rstrip("PC"))
+        return k_short, k_long, is_put
+    except Exception:
+        return np.nan, np.nan, True
 
 def mark_to_market(row: pd.Series) -> Tuple[float,float]:
+    # 與你現有版本相同（這段保留）；若取不到 mid 就回 (nan, nan)
     ticker=row["Ticker"]; exp=row["Exp"]; legs=row["Legs"]; qty=int(row["Qty"])
     try:
         k_short = float(legs.split()[3].rstrip("PC"))
@@ -619,12 +678,126 @@ def mark_to_market(row: pd.Series) -> Tuple[float,float]:
     pnl = (entry - spread_now) * qty
     return spread_now, pnl
 
-def save_book(positions: pd.DataFrame, todays: pd.DataFrame, scan_table: Optional[pd.DataFrame]=None):
+def _today_utc_date():
+    return _now_utc().date()
+
+def _dte_from_exp(exp_str: str) -> int:
+    try:
+        d = datetime.strptime(exp_str,"%Y-%m-%d").date()
+        return (d - _today_utc_date()).days
+    except Exception:
+        return 9999
+
+def _apply_slippage_credit(credit: float) -> float:
+    return credit * (1.0 - SLIPPAGE_PCT)
+
+def _apply_slippage_debit(debit: float) -> float:
+    return debit * (1.0 + SLIPPAGE_PCT)
+
+def decide_exit(row: pd.Series) -> Tuple[bool, Optional[float], Optional[str]]:
+    """根據規則判斷是否平倉；回 (should_close, exit_debit, reason)"""
+    if str(row.get("Status","")) != "OPEN":
+        return (False, None, None)
+
+    entry = float(row.get("EntryCredit", np.nan))
+    cur   = float(row.get("SpreadNow",  np.nan))
+    dte   = _dte_from_exp(str(row.get("Exp","")))
+
+    if not np.isnan(cur):
+        # 目標獲利（拿到 X% 權利金）：買回成本 <= (1 - X%) * Entry
+        if cur <= entry * (1.0 - TAKE_PROFIT_PCT):
+            return (True, _apply_slippage_debit(max(cur, 0.01)), "TP")
+
+        # 停損（2x 權利金）
+        if cur >= entry * STOP_LOSS_MULT:
+            return (True, _apply_slippage_debit(cur), "SL")
+
+    # 時間出場：剩餘 DTE <= EXIT_AT_DTE_LE
+    if dte <= EXIT_AT_DTE_LE and not np.isnan(cur):
+        return (True, _apply_slippage_debit(cur), "DTE")
+
+    # 到期處理（dte <= 0）：盡量用 MTM，若拿不到就用內在價估
+    if dte <= 0:
+        kS, kL, is_put = _parse_strike_legs(str(row["Legs"]))
+        try:
+            S = float(yf_history(row["Ticker"], period="1d", interval="1d")["Close"].iloc[-1])
+        except Exception:
+            S = float(row.get("Spot_Entry", np.nan))
+        width = abs(kL - kS) * 100.0
+        intrinsic = 0.0
+        if is_put:
+            intrinsic = max(0.0, (kS - S))*100.0 - max(0.0, (kL - S))*100.0
+        else:
+            intrinsic = max(0.0, (S - kS))*100.0 - max(0.0, (S - kL))*100.0
+        intrinsic = min(max(intrinsic, 0.0), width)
+        return (True, _apply_slippage_debit(intrinsic), "EXP")
+
+    return (False, None, None)
+
+def append_trade(trades_df: pd.DataFrame, when_str: str, trade_id: int, side: str,
+                 row_like: dict, price: float, note: str="") -> pd.DataFrame:
+    new = {
+        "Datetime": when_str, "TradeID": trade_id, "Side": side,
+        "Ticker": row_like["Ticker"], "Strategy": row_like["Strategy"],
+        "Legs": row_like["Legs"], "Exp": row_like["Exp"],
+        "Price": round(price,2), "Qty": int(row_like.get("Qty",1)), "Note": note
+    }
+    return pd.concat([trades_df, pd.DataFrame([new])], ignore_index=True)
+
+def recompute_daily_nav(positions_df: pd.DataFrame) -> Tuple[float, float, float, int]:
+    """回 (realized_sum, open_pnl_sum, nav, open_cnt)"""
+    opens = positions_df[positions_df["Status"]=="OPEN"]
+    closed = positions_df[positions_df["Status"]=="CLOSED"]
+    realized = float(pd.to_numeric(closed.get("RealizedPnL", 0.0), errors="coerce").fillna(0.0).sum())
+    open_pnl = float(pd.to_numeric(opens.get("PnL$", 0.0), errors="coerce").fillna(0.0).sum())
+    nav = NAV0 + realized + open_pnl
+    return realized, open_pnl, nav, len(opens)
+
+def _ensure_position_columns(df: pd.DataFrame) -> pd.DataFrame:
+    need_cols = ["ExitDate","ExitDebit","RealizedPnL","CloseReason"]
+    for c in need_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df
+
+def load_positions() -> pd.DataFrame:
+    if os.path.exists(EXCEL_PATH):
+        try:
+            df = pd.read_excel(EXCEL_PATH, sheet_name="Positions")
+            return _ensure_position_columns(df)
+        except Exception:
+            pass
+    cols=["TradeID","Date","Ticker","Strategy","Legs","Exp","DTE_Orig",
+          "EntryCredit","MaxLoss","Qty","Status","Thesis",
+          "Spot_Entry","Delta_Sh","Vega_$","Sector","SpreadNow","PnL$",
+          "ExitDate","ExitDebit","RealizedPnL","CloseReason"]
+    return pd.DataFrame(columns=cols)
+
+def load_sheets_all():
+    """把舊檔所有 sheet 讀進來，沒有就給空表。"""
+    sheets = {}
+    if os.path.exists(EXCEL_PATH):
+        try:
+            sheets = pd.read_excel(EXCEL_PATH, sheet_name=None)
+        except Exception:
+            pass
+    sheets["Positions"]    = _ensure_position_columns(sheets.get("Positions", load_positions()))
+    sheets["TodaysPicks"]  = sheets.get("TodaysPicks", pd.DataFrame())
+    sheets["ScanSnapshot"] = sheets.get("ScanSnapshot", pd.DataFrame())
+    # 交易日誌（每一筆進／出場一列）
+    if "Trades" not in sheets:
+        sheets["Trades"] = pd.DataFrame(columns=[
+            "Datetime","TradeID","Side","Ticker","Strategy","Legs","Exp","Price","Qty","Note"
+        ])
+    # NAV/績效日線
+    if "DailyNAV" not in sheets:
+        sheets["DailyNAV"] = pd.DataFrame(columns=["Date","RealizedPnLToDate","OpenPnL","NAV","OpenPositions"])
+    return sheets
+
+def save_all_sheets(sheets: Dict[str, pd.DataFrame]):
     with pd.ExcelWriter(EXCEL_PATH, engine="xlsxwriter") as w:
-        positions.to_excel(w, index=False, sheet_name="Positions")
-        todays.to_excel(w, index=False, sheet_name="TodaysPicks")
-        if scan_table is not None and not scan_table.empty:
-            scan_table.to_excel(w, index=False, sheet_name="ScanSnapshot")
+        for name, df in sheets.items():
+            df.to_excel(w, index=False, sheet_name=name)
 
 
 
@@ -644,16 +817,26 @@ def run_once(base_positions: Optional[pd.DataFrame]=None):
     HTTP_CALLS = 0; HTTP_429S = 0; SLEEP_SEC_ACCUM = 0.0
     t0 = time.time()
 
-    # A) Scan universe
+    # 先把最新 Excel 從 GCS 拉下來到 /tmp
+    try:
+        gcs_download_latest()
+    except Exception as e:
+        print("GCS download skipped/failed:", e)
+
+    
+
+
+    # 載入所有 sheet
+    sheets = load_sheets_all()
+    book = sheets["Positions"].copy()
+    trades = sheets["Trades"].copy()
+    daily = sheets["DailyNAV"].copy()
+
+    # A) Scanner
     tickers, scan_snapshot = scan_liquid_high_iv(TOP_N)
     print(f"Universe picks (top {TOP_N}):", tickers)
 
-    # B) Load existing + MTM（優先用外部傳入的 base_positions）
-    if base_positions is not None and isinstance(base_positions, pd.DataFrame):
-        book = base_positions.copy()
-    else:
-        book = load_positions()
-
+    # B) MTM（先更新所有 OPEN 的 SpreadNow、PnL$）
     if not book.empty:
         mtm_price, mtm_pnl = [], []
         for _, r in book.iterrows():
@@ -665,16 +848,53 @@ def run_once(base_positions: Optional[pd.DataFrame]=None):
         book["SpreadNow"] = mtm_price
         book["PnL$"] = mtm_pnl
 
+    # C) 先嘗試平倉（TP/SL/DTE/到期）
+    if not book.empty:
+        changed_idx = []
+        for idx, r in book.iterrows():
+            if str(r.get("Status","")) != "OPEN":
+                continue
+            should_close, exit_debit, reason = decide_exit(r)
+            if should_close and (exit_debit is not None) and np.isfinite(exit_debit):
+                when = _now_utc().strftime("%Y-%m-%d %H:%M")
+                trade_id = int(r["TradeID"])
+                qty = int(r.get("Qty",1))
+                entry_credit = float(r["EntryCredit"])     # 這個值本來就已經扣過滑價
+                realized = (entry_credit - float(exit_debit)) * qty
+                book.loc[idx, "ExitDate"] = when
+                book.loc[idx, "ExitDebit"] = round(float(exit_debit),2)
+                book.loc[idx, "RealizedPnL"] = round(realized,2)
+                book.loc[idx, "Status"] = "CLOSED"
+                book.loc[idx, "CloseReason"] = reason
+                trades = append_trade(trades, when, trade_id, "CLOSE", r, float(exit_debit), note=reason)
+                changed_idx.append(idx)
+
+        if changed_idx:
+            print(f"Closed {len(changed_idx)} positions:", changed_idx)
+
+    # D) 重新計算平倉後的 MTM（避免平倉後還殘留 PnL）
+    if not book.empty:
+        mtm_price, mtm_pnl = [], []
+        for _, r in book.iterrows():
+            if str(r.get("Status","")) == "OPEN":
+                p_now, pnl = mark_to_market(r)
+                mtm_price.append(p_now); mtm_pnl.append(pnl)
+            else:
+                mtm_price.append(np.nan); mtm_pnl.append(np.nan)
+        book["SpreadNow"] = mtm_price
+        book["PnL$"] = mtm_pnl
+
+    # E) 避免重複腿
     open_legs = set(book.loc[book["Status"]=="OPEN", "Legs"]) if not book.empty else set()
 
-    # 既有 OPEN 的籃子曝險
+    # 既有 OPEN 籃子曝險
     def existing_open_exposure(book_df: pd.DataFrame) -> Tuple[float, float]:
         if book_df.empty: return 0.0, 0.0
         opens = book_df[book_df["Status"]=="OPEN"].copy()
         if opens.empty: return 0.0, 0.0
-        tickers = opens["Ticker"].unique().tolist()
+        tickers_ = opens["Ticker"].unique().tolist()
         S_map: Dict[str, float] = {}
-        for t in tickers:
+        for t in tickers_:
             try:
                 S_map[t] = float(yf_history(t, period="1d", interval="1d")["Close"].iloc[-1])
             except Exception:
@@ -690,22 +910,19 @@ def run_once(base_positions: Optional[pd.DataFrame]=None):
 
     base_delta_dollars, base_vega_dollars = existing_open_exposure(book)
 
-    # C) Build candidates only for scanned tickers
+    # F) 只對 Scanner 的 tickers 建候選、過濾、排名、選出今天要開的新倉
     candidates: List[Candidate] = []
     for t in tickers:
         try:
             candidates += build_spreads_for_ticker(t)
         except Exception:
             continue
-
-    # D) Hard filters
     candidates = [c for c in candidates if passes_hard_filters(c)]
+    ranked = rank_candidates(candidates)
 
-    # E) Ranking + sector cap + basket exposure + avoid duplicate legs
     todays = []
     sector_counts: Dict[str,int] = {}
     selected: List[Candidate] = []
-    ranked = rank_candidates(candidates)
 
     for c, score, thesis in ranked:
         if len(selected) >= 5: break
@@ -727,28 +944,60 @@ def run_once(base_positions: Optional[pd.DataFrame]=None):
 
     todays_df = pd.DataFrame(todays)
 
-    # F) Paper BUY append
+    # G) Paper BUY：把今日選到的單寫進 Positions + Trades（含滑價）
     if not todays_df.empty:
         start_id = 1 if book.empty else int(pd.to_numeric(book["TradeID"], errors="coerce").fillna(0).max()) + 1
         rows=[]
         for i, r in todays_df.iterrows():
-            rows.append({
+            entry_credit_eff = _apply_slippage_credit(float(r["Credit($)"]))
+            when = _now_utc().strftime("%Y-%m-%d %H:%M")
+            row_new = {
                 "TradeID": start_id + i,
-                "Date": _now_utc().strftime("%Y-%m-%d %H:%M"),
+                "Date": when,
                 "Ticker": r["Ticker"], "Strategy": r["Strategy"], "Legs": r["Legs"],
                 "Exp": r["Legs"].split()[2], "DTE_Orig": r["DTE"],
-                "EntryCredit": r["Credit($)"], "MaxLoss": r["MaxLoss($)"],
+                "EntryCredit": entry_credit_eff, "MaxLoss": r["MaxLoss($)"],
                 "Qty": 1, "Status": "OPEN", "Thesis": r["Thesis"],
                 "Spot_Entry": float(yf_history(r["Ticker"], period="1d", interval="1d")["Close"].iloc[-1]),
                 "Delta_Sh": r["Delta_Sh"], "Vega_$": r["Vega_$"],
-                "Sector": r["Sector"], "SpreadNow": np.nan, "PnL$": np.nan
-            })
+                "Sector": r["Sector"], "SpreadNow": np.nan, "PnL$": np.nan,
+                "ExitDate": np.nan, "ExitDebit": np.nan, "RealizedPnL": np.nan, "CloseReason": np.nan
+            }
+            rows.append(row_new)
+            # 交易日誌記一筆「OPEN」
+            trades = append_trade(trades, when, row_new["TradeID"], "OPEN", row_new, entry_credit_eff, note="ENTRY")
+
         book = pd.concat([book, pd.DataFrame(rows)], ignore_index=True)
 
-    # G) Save Excel（本地；Cloud Run 版用 app.py 會寫 GCS）
-    save_book(book, todays_df, scan_snapshot)
+    # H) NAV 曲線：當日快照
+    realized, open_pnl, nav, open_cnt = recompute_daily_nav(book)
+    daily = pd.concat([daily, pd.DataFrame([{
+        "Date": _now_utc().strftime("%Y-%m-%d"),
+        "RealizedPnLToDate": round(realized,2),
+        "OpenPnL": round(open_pnl,2),
+        "NAV": round(nav,2),
+        "OpenPositions": open_cnt
+    }])], ignore_index=True).drop_duplicates(subset=["Date"], keep="last")
 
-    # H) Metrics & logging（stdout 由 Cloud Run 收）
+    # I) 存檔
+    sheets["Positions"]    = book
+    sheets["TodaysPicks"]  = todays_df
+    sheets["ScanSnapshot"] = scan_snapshot
+    sheets["Trades"]       = trades
+    sheets["DailyNAV"]     = daily
+    
+
+    # I) 存檔（本地）
+    save_all_sheets(sheets)
+
+    # I+) 上傳 GCS（latest 會覆蓋，archive 不要覆蓋）
+    try:
+        gcs_upload_workbook(sheets)
+        print(f"Uploaded to gs://{GCS_BUCKET}/{GCS_LATEST} (+ archived)")
+    except Exception as e:
+        print("GCS upload failed (kept local copy):", e)
+
+    # J) Metrics
     elapsed = max(1e-6, time.time() - t0)
     rps = HTTP_CALLS / elapsed
     print(f"\nCandidates: {len(candidates)} | Selected today: {len(todays_df)}")
@@ -756,8 +1005,8 @@ def run_once(base_positions: Optional[pd.DataFrame]=None):
     print(f"Excel saved -> {EXCEL_PATH}")
     print("Skip reasons:", SKIP)
 
-    # 回傳三個 DataFrame，給 app.py 上傳到 GCS
     return book, todays_df, scan_snapshot
+
 
 
 # --- Jupyter: 呼叫 run_once() 即可 ---
